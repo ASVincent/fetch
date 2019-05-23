@@ -15,6 +15,7 @@ from ._core import SimpleObject, DataSource, fetch_file, RemoteFetchException
 from .compat import urljoin
 
 DEFAULT_CONNECT_TIMEOUT_SECS = 100
+DEFAULT_REQUEST_RETRIES = 1
 
 _log = logging.getLogger(__name__)
 
@@ -56,13 +57,15 @@ class HttpPostAction(SimpleObject):
     (such as posting login credentials before retrievals)
     """
 
-    def __init__(self, url, params):
+    def __init__(self, url, params, request_retries=DEFAULT_REQUEST_RETRIES):
         """
         :type url: str
         :type params: dict of (str, str)
+        :type request_retries: int
         """
         self.url = url
         self.params = params
+        self.request_retries = request_retries
 
     def get_result(self, session):
         """
@@ -70,7 +73,17 @@ class HttpPostAction(SimpleObject):
 
         :type session: requests.Session
         """
-        return closing(session.post(self.url, params=self.params))
+        tries = 0
+        while tries < self.request_retries:
+            tries += 1
+            try:
+                return closing(session.post(self.url, params=self.params))
+            except requests.ConnectTimeout as exc:
+                _log.debug('Connection timed out for request %i of %i',
+                           tries, self.request_retries)
+
+        raise RemoteFetchException("Unable to authenticate post %s",
+                                   self.url)
 
 
 class HttpAuthAction(SimpleObject):
@@ -78,15 +91,25 @@ class HttpAuthAction(SimpleObject):
     Performs authentication for the session provided.
     """
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, username, password,
+                 request_retries=DEFAULT_REQUEST_RETRIES):
         self.url = url
         self.params = (username, password)
+        self.request_retries = request_retries
 
     def get_result(self, session):
-        url = session.request('get', self.url).url
-
-        session.auth = self.params
-        return closing(session.get(url, auth=self.params))
+        tries = 0
+        while tries < self.request_retries:
+            tries += 1
+            try:
+                url = session.request('get', self.url).url
+                session.auth = self.params
+                return closing(session.get(url, auth=self.params))
+            except requests.ConnectTimeout as exc:
+                _log.debug('Connection timed out for request %i of %i',
+                           tries, self.request_retries)
+        raise RemoteFetchException("Unable to authenticate against %s",
+                                   self.url)
 
 
 class _HttpBaseSource(DataSource):
@@ -100,7 +123,8 @@ class _HttpBaseSource(DataSource):
                  urls=None,
                  filename_transform=None,
                  beforehand=None,
-                 connection_timeout=DEFAULT_CONNECT_TIMEOUT_SECS):
+                 connection_timeout=DEFAULT_CONNECT_TIMEOUT_SECS,
+                 request_retries=DEFAULT_REQUEST_RETRIES):
         """
         :type urls: list of str
         :type url: str
@@ -108,6 +132,7 @@ class _HttpBaseSource(DataSource):
         :type beforehand: HttpPostAction
         :type filename_transform: FilenameTransform
         :type connection_timeout: float
+        :type request_retries: int
         """
         super(_HttpBaseSource, self).__init__()
         self.target_dir = target_dir
@@ -121,6 +146,7 @@ class _HttpBaseSource(DataSource):
 
         # Connection timeout in seconds
         self.connection_timeout = connection_timeout
+        self.request_retries = request_retries
 
     def _get_all_urls(self):
         """
@@ -185,19 +211,36 @@ class _HttpBaseSource(DataSource):
 
         def do_fetch(t):
             """Fetch data to filename t"""
-            with closing(session.get(url, stream=True, timeout=self.connection_timeout)) as res:
-                if res.status_code != 200:
+            tries = 0
+            res = None
+            while tries < self.request_retries:
+                tries += 1
+                try:
+                    with closing(session.get(url, stream=True,
+                                 timeout=self.connection_timeout)) as res:
+                        if res.status_code == 200:
+                            with open(t, 'wb') as f:
+                                for chunk in res.iter_content(4096):
+                                    if chunk:
+                                        f.write(chunk)
+                                        f.flush()
+                            return True
+                except requests.ConnectTimeout as exc:
+                    _log.debug('Connection timed out for request %i of %i',
+                               tries, self.request_retries)
+            else:
+                # Exceeded retry count
+                if res:
                     body = res.text
                     _log.debug('Received text %r', res.text)
                     reporter.file_error(url, "Status code %r" % res.status_code, body)
                     return False
 
-                with open(t, 'wb') as f:
-                    for chunk in res.iter_content(4096):
-                        if chunk:
-                            f.write(chunk)
-                            f.flush()
-            return True
+            if not res:
+                reporter.file_error(url, "No request object found", "")
+
+                return False
+
 
         fetch_file(
             url,
@@ -243,13 +286,15 @@ class HttpListingSource(_HttpBaseSource):
                  name_pattern='.*',
                  filename_transform=None,
                  beforehand=None,
-                 connection_timeout=DEFAULT_CONNECT_TIMEOUT_SECS):
+                 connection_timeout=DEFAULT_CONNECT_TIMEOUT_SECS,
+                 request_retries=DEFAULT_REQUEST_RETRIES):
         super(HttpListingSource, self).__init__(target_dir,
                                                 url=url,
                                                 urls=urls,
                                                 filename_transform=filename_transform,
                                                 beforehand=beforehand,
-                                                connection_timeout=connection_timeout)
+                                                connection_timeout=connection_timeout,
+                                                request_retries=request_retries)
         self.name_pattern = name_pattern
 
     def trigger_url(self, reporter, session, url):
@@ -259,17 +304,35 @@ class HttpListingSource(_HttpBaseSource):
         :type session: requests.Session
         :type url: str
         """
-        res = session.get(url, timeout=self.connection_timeout)
-        if res.status_code == 404:
-            _log.debug("Listing page doesn't exist yet. Skipping.")
-            return
+        tries = 0
+        res = None
+        while tries < self.request_retries:
+            tries += 1
+            try:
+                with closing(session.get(url, timeout=self.connection_timeout)) as res:
+                    if res.status_code == 404:
+                        _log.debug("Listing page doesn't exist yet. Skipping.")
+                        return
 
-        if res.status_code != 200:
+                    if res.status_code == 200:
+                        break
+            except requests.ConnectTimeout as exc:
+                _log.debug('Connection timed out for request %i of %i',
+                           tries, self.request_retries)
+
+        else:
+            # retries exceeded
             # We don't bother with reporter.file_error() as this initial fetch is critical.
             # Throw an exception instead.
-            raise RemoteFetchException(
-                "Status code %r" % res.status_code,
-                '{url}\n\n{body}'.format(url=url, body=res.text)
+            if res:
+                raise RemoteFetchException(
+                    "Status code %r" % res.status_code,
+                    '{url}\n\n{body}'.format(url=url, body=res.text)
+                )
+
+        if not res:
+            raise RemoteFetchExceptiion(
+                "No request object found for {url}".format(url=url)
             )
 
         # pylint fails to identify native functions under our virtualenv...
@@ -326,14 +389,29 @@ class RssSource(_HttpBaseSource):
         :type url: str
         """
         # Fetch feed.
-        res = session.get(url, timeout=self.connection_timeout)
+        tries = 0
+        res = None
+        while tries < self.request_retries:
+            tries += 1
+            try:
+                with closing(sesion.get(url, timeout=self.connection_timeout)) as res:
 
-        if res.status_code != 200:
-            # We don't bother with reporter.file_error() as this initial fetch is critical.
-            # Throw an exception instead.
-            raise RemoteFetchException(
-                "Status code %r" % res.status_code,
-                '{url}\n\n{body}'.format(url=url, body=res.text)
+                    if res.status_code == 200:
+                        break
+            except requests.ConnectTimeout as exc:
+                _log.debug('Connection timed out for request %i of %i',
+                           tries, self.request_retries)
+        else:
+            # Retries exceeded
+            if res:
+                raise RemoteFetchException(
+                    "Status code %r" % res.status_code,
+                    '{url}\n\n{body}'.format(url=url, body=res.text)
+                )
+
+        if not res:
+            raise RemoteFetchExceptiion(
+                "No request object found for {url}".format(url=url)
             )
 
         feed = feedparser.parse(res.text)
